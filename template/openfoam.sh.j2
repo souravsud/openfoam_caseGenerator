@@ -1,0 +1,17 @@
+#!/bin/bash
+#SBATCH --job-name={{ job_name }}
+#SBATCH --account={{ account }}
+#SBATCH --partition={{ partition }}
+#SBATCH --nodes={{ nodes }}
+#SBATCH --ntasks={{ ntasks }}
+#SBATCH --time={{ walltime }}
+
+
+module purge
+module load OpenFOAM/v2506-foss-2025a
+
+cd $SLURM_SUBMIT_DIR
+source $FOAM_BASH
+
+chmod +x Allrun
+./Allrun

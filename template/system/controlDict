@@ -1,0 +1,98 @@
+/*--------------------------------*- C++ -*----------------------------------*\
+  =========                 |
+  \\      /  F ield         | OpenFOAM: The Open Source CFD Toolbox
+   \\    /   O peration     | Website:  https://openfoam.org
+    \\  /    A nd           | Version:  12
+     \\/     M anipulation  |
+\*---------------------------------------------------------------------------*/
+FoamFile
+{
+    format      ascii;
+    class       dictionary;
+    object      controlDict;
+}
+// * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * //
+
+application     simpleFoam;
+
+startFrom       latestTime;
+
+startTime       0;
+
+stopAt          endTime;
+
+endTime         {{ end_time}};
+
+deltaT          1;
+
+writeControl    timeStep;
+
+writeInterval   {{ write_interval }};
+
+purgeWrite      0;
+
+writeFormat     ascii;
+
+writePrecision  6;
+
+writeCompression off;
+
+timeFormat      general;
+
+timePrecision   6;
+
+runTimeModifiable yes;
+
+libs ("libatmosphericModels.so");
+
+// ************************************************************************* //
+
+
+functions
+{
+    fileUpdate_Solution
+    {
+        type              timeActivatedFileUpdate;
+        libs              (utilityFunctionObjects);
+        writeControl      timeStep;
+        writeInterval     1;
+        fileToUpdate      "$FOAM_CASE/system/fvSchemes";
+        timeVsFile
+        (
+            (-1   "$FOAM_CASE/system/fvSchemes_1")
+            (1000 "$FOAM_CASE/system/fvSchemes_2")
+        );
+    }
+    
+    towerProfiles
+    {
+        type            sets;
+        libs            (sampling);  // Changed from functionObjectLibs
+        enabled         true;
+        verbose         true;
+        interpolationScheme cellPoint;
+        writeControl    writeTime;
+        writeInterval   1;
+        
+        fields
+        (
+            U k epsilon
+        );
+        
+        sets
+        (
+            central_tower
+            {
+                type            uniform;  // Changed from lineCell
+                axis            xyz;
+                start           ({{center_lat}} {{center_lon}} 0);
+                end             ({{center_lat}} {{center_lon}} 3000);
+                nPoints         1000;
+            }
+            
+        );
+        
+        setFormat       csv;
+        setPrecision    6;
+    }
+}

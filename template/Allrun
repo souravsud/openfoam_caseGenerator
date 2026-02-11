@@ -1,0 +1,26 @@
+#!/bin/sh
+
+cd "$(dirname "$0")" || exit 1
+
+. $WM_PROJECT_DIR/bin/tools/RunFunctions
+set -e
+
+export WM_NPROCS=${SLURM_NTASKS:-1}
+
+RUN_STAGE=${RUN_STAGE:-solve}
+
+if [ "$RUN_STAGE" = "mesh" ]; then
+    runApplication blockMesh
+    runApplication checkMesh
+    exit 0
+fi
+
+# ---- SOLVE STAGE ----
+
+runApplication decomposePar -force
+runParallel simpleFoam
+runApplication reconstructParMesh -constant
+runApplication reconstructPar -latestTime
+rm -rf processor*
+python3 residualPlot.py
+

@@ -1,0 +1,93 @@
+/*--------------------------------*- C++ -*----------------------------------*\
+  =========                 |
+  \\      /  F ield         | OpenFOAM: The Open Source CFD Toolbox
+   \\    /   O peration     | Website:  https://openfoam.org
+    \\  /    A nd           | Version:  12
+     \\/     M anipulation  |
+\*---------------------------------------------------------------------------*/
+FoamFile
+{
+    format      ascii;
+    class       dictionary;
+    object      fvSolution;
+}
+// * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * //
+
+solvers
+{
+    p
+    {
+        solver          GAMG;
+        tolerance       1e-6;
+        relTol          0.01;
+        smoother        DICGaussSeidel;
+        nPreSweeps      1;
+        nPostSweeps     2;
+        cacheAgglomeration true;
+        agglomerator    faceAreaPair;
+        nCellsInCoarsestLevel 50;
+        mergeLevels     1;
+        maxIter         60;
+}
+
+    U
+    {
+        solver           smoothSolver;
+        smoother         GaussSeidel;
+        tolerance        1e-6;
+        relTol           0.1;
+        nSweeps          1;
+    }
+
+    k
+    {
+        solver           smoothSolver;
+        smoother         GaussSeidel;
+        tolerance        1e-6;
+        relTol           0.1;
+        nSweeps          2;
+    }
+
+    epsilon
+    {
+        solver           smoothSolver;
+        smoother         GaussSeidel;
+        tolerance        1e-6;
+        relTol           0.1;
+        nSweeps          2;
+    }
+}
+
+SIMPLE
+{
+    nNonOrthogonalCorrectors 2;
+
+    //residualControl
+    /* {
+        p               1e-4;
+        U               1e-4;
+        "(k|epsilon)"   1e-5;
+    } */
+    pRefPoint       (608449.0 4396470.0 2750);    // replace with your coordinates
+    pRefValue       0;
+}
+relaxationFactors
+{
+    fields
+    {
+        p               0.40;
+    }
+    equations
+    {
+        U               0.60;
+        k               0.60;
+        epsilon         0.60;
+    }
+}
+
+cache
+{
+    grad(U);
+}
+
+// ************************************************************************* //
