@@ -4,15 +4,21 @@ from jinja2 import Template
 import json
 import os
 import subprocess
+from multiprocessing import Pool
+from datetime import datetime
 
 
 class OpenFOAMCaseGenerator:
 
-    def __init__(self, template_path, input_dir, output_dir):
+    def __init__(self, template_path, input_dir, output_dir, deucalion_path=None):
         self.template_path = Path(template_path)
         self.input_root = Path(input_dir)
         self.output_dir = Path(output_dir)
         self.output_dir.mkdir(parents=True, exist_ok=True)
+        
+        # Deucalion remote path
+        self.deucalion_host = "deucalion"
+        self.deucalion_path = deucalion_path or "/projects/EEHPC-BEN-2026B02-011/cfd_data"
 
         # Centralized HPC defaults
         self.hpc_defaults = {
@@ -143,8 +149,11 @@ class OpenFOAMCaseGenerator:
             status = {
                 "mesh_status": "NOT_RUN",
                 "mesh_ok": False,
+                "copied_to_hpc": False,
                 "submitted": False,
-                "job_id": None
+                "job_id": None,
+                "job_status": None,
+                "last_checked": None
             }
             with open(status_file, 'w') as f:
                 json.dump(status, f, indent=2)
@@ -159,42 +168,94 @@ class OpenFOAMCaseGenerator:
         with open(status_file, 'w') as f:
             json.dump(status, f, indent=2)
 
+    def get_status(self, case_path):
+        status_file = case_path / "case_status.json"
+        if not status_file.exists():
+            return None
+        with open(status_file) as f:
+            return json.load(f)
+
     # --------------------------------------------------
-    # LOCAL MESHING
+    # LOCAL MESHING (Single case - used by parallel worker)
     # --------------------------------------------------
 
     def mesh_case(self, case_path):
-        print(f"Meshing: {case_path.name}")
+        """Mesh a single case - designed to be called by parallel workers"""
+        case_path = Path(case_path)  # Ensure Path object
+        print(f"[MESH START] {case_path.name}")
 
-        env = os.environ.copy()
-        env["RUN_STAGE"] = "mesh"
+        try:
+            env = os.environ.copy()
+            env["RUN_STAGE"] = "mesh"
 
-        subprocess.run(
-            ["bash", "Allrun"],
-            cwd=case_path,
-            env=env,
-            check=True
-        )
+            subprocess.run(
+                ["bash", "Allrun"],
+                cwd=case_path,
+                env=env,
+                check=True,
+                capture_output=True,
+                text=True
+            )
 
-        # Check mesh log
-        log_file = case_path / "log.checkMesh"
+            # Check mesh log
+            log_file = case_path / "log.checkMesh"
 
-        if log_file.exists():
-            with open(log_file) as f:
-                content = f.read()
+            if log_file.exists():
+                with open(log_file) as f:
+                    content = f.read()
 
-            if "Mesh OK" in content:
-                print("Mesh OK.")
-                self.update_status(case_path, {
-                    "mesh_status": "DONE",
-                    "mesh_ok": True
-                })
+                if "Mesh OK" in content:
+                    print(f"[MESH OK] {case_path.name}")
+                    self.update_status(case_path, {
+                        "mesh_status": "DONE",
+                        "mesh_ok": True
+                    })
+                    return True
+                else:
+                    print(f"[MESH FAILED] {case_path.name}")
+                    self.update_status(case_path, {
+                        "mesh_status": "FAILED",
+                        "mesh_ok": False
+                    })
+                    return False
             else:
-                print("Mesh FAILED.")
+                print(f"[MESH ERROR] No log.checkMesh found for {case_path.name}")
                 self.update_status(case_path, {
-                    "mesh_status": "FAILED",
+                    "mesh_status": "ERROR",
                     "mesh_ok": False
                 })
+                return False
+
+        except subprocess.CalledProcessError as e:
+            print(f"[MESH ERROR] {case_path.name}: {e}")
+            self.update_status(case_path, {
+                "mesh_status": "ERROR",
+                "mesh_ok": False
+            })
+            return False
+
+    # --------------------------------------------------
+    # PARALLEL MESHING
+    # --------------------------------------------------
+
+    def mesh_cases_parallel(self, cases, n_workers=4):
+        """Mesh multiple cases in parallel"""
+        print(f"\n{'='*60}")
+        print(f"Starting parallel meshing: {len(cases)} cases, {n_workers} workers")
+        print(f"{'='*60}\n")
+
+        with Pool(n_workers) as pool:
+            results = pool.map(self.mesh_case, cases)
+
+        # Summary
+        success = sum(results)
+        failed = len(results) - success
+        
+        print(f"\n{'='*60}")
+        print(f"Meshing complete: {success} succeeded, {failed} failed")
+        print(f"{'='*60}\n")
+
+        return results
 
     # --------------------------------------------------
     # HPC SCRIPT RENDERING
@@ -223,33 +284,172 @@ class OpenFOAMCaseGenerator:
             os.chmod(output_file, 0o755)
 
     # --------------------------------------------------
-    # READY CASE LISTING
+    # DEUCALION COPY
     # --------------------------------------------------
 
-    def list_ready_cases(self, limit=None):
-        ready = []
+    def copy_to_deucalion(self, case_path):
+        """Copy meshed case to deucalion using rsync with compression"""
+        case_path = Path(case_path)
+        case_name = case_path.name
+        
+        print(f"[COPY START] {case_name} -> deucalion")
 
-        for case_dir in self.output_dir.iterdir():
-            status_file = case_dir / "case_status.json"
-            if not status_file.exists():
+        try:
+            # Rsync with compression, preserve permissions
+            cmd = [
+                "rsync",
+                "-avz",  # archive, verbose, compress
+                "--progress",
+                f"{case_path}/",
+                f"{self.deucalion_host}:{self.deucalion_path}/{case_name}/"
+            ]
+
+            result = subprocess.run(
+                cmd,
+                check=True,
+                capture_output=True,
+                text=True
+            )
+
+            print(f"[COPY OK] {case_name}")
+            self.update_status(case_path, {"copied_to_hpc": True})
+            return True
+
+        except subprocess.CalledProcessError as e:
+            print(f"[COPY FAILED] {case_name}: {e.stderr}")
+            return False
+
+    # --------------------------------------------------
+    # HPC SUBMISSION
+    # --------------------------------------------------
+
+    def submit_case(self, case_path):
+        """Submit case to HPC via SSH sbatch"""
+        case_path = Path(case_path)
+        case_name = case_path.name
+        
+        print(f"[SUBMIT START] {case_name}")
+
+        try:
+            # SSH into deucalion and submit
+            cmd = [
+                "ssh",
+                self.deucalion_host,
+                f"cd {self.deucalion_path}/{case_name} && sbatch openfoam.sh"
+            ]
+
+            result = subprocess.run(
+                cmd,
+                check=True,
+                capture_output=True,
+                text=True
+            )
+
+            # Parse job ID from sbatch output: "Submitted batch job 123456"
+            output = result.stdout.strip()
+            if "Submitted batch job" in output:
+                job_id = output.split()[-1]
+                print(f"[SUBMIT OK] {case_name} -> Job ID: {job_id}")
+                
+                self.update_status(case_path, {
+                    "submitted": True,
+                    "job_id": job_id,
+                    "job_status": "PENDING",
+                    "last_checked": datetime.now().isoformat()
+                })
+                return job_id
+            else:
+                print(f"[SUBMIT ERROR] {case_name}: Unexpected sbatch output")
+                return None
+
+        except subprocess.CalledProcessError as e:
+            print(f"[SUBMIT FAILED] {case_name}: {e.stderr}")
+            return None
+
+    # --------------------------------------------------
+    # JOB STATUS CHECK
+    # --------------------------------------------------
+
+    def check_job_status(self, job_id):
+        """Check job status using squeue/sacct"""
+        try:
+            # Try squeue first (for running/pending jobs)
+            cmd = ["ssh", self.deucalion_host, f"squeue -j {job_id} --noheader --format=%T"]
+            result = subprocess.run(cmd, capture_output=True, text=True, timeout=10)
+            
+            if result.returncode == 0 and result.stdout.strip():
+                return result.stdout.strip()  # PENDING, RUNNING, etc.
+            
+            # If not in squeue, check sacct (for completed jobs)
+            cmd = ["ssh", self.deucalion_host, f"sacct -j {job_id} --noheader --format=State -P | head -1"]
+            result = subprocess.run(cmd, capture_output=True, text=True, timeout=10)
+            
+            if result.returncode == 0 and result.stdout.strip():
+                return result.stdout.strip()  # COMPLETED, FAILED, etc.
+            
+            return "UNKNOWN"
+
+        except Exception as e:
+            print(f"[STATUS CHECK ERROR] Job {job_id}: {e}")
+            return "ERROR"
+
+    def update_job_status(self, case_path):
+        """Update job status for a specific case"""
+        status = self.get_status(case_path)
+        
+        if not status or not status.get("job_id"):
+            return None
+        
+        job_id = status["job_id"]
+        job_status = self.check_job_status(job_id)
+        
+        self.update_status(case_path, {
+            "job_status": job_status,
+            "last_checked": datetime.now().isoformat()
+        })
+        
+        return job_status
+
+    # --------------------------------------------------
+    # CASE LISTING
+    # --------------------------------------------------
+
+    def list_cases_by_status(self, mesh_status=None, submitted=None):
+        """List cases filtered by status"""
+        cases = []
+
+        for case_dir in sorted(self.output_dir.iterdir()):
+            if not case_dir.is_dir():
+                continue
+                
+            status = self.get_status(case_dir)
+            if not status:
                 continue
 
-            with open(status_file) as f:
-                status = json.load(f)
+            # Apply filters
+            if mesh_status and status.get("mesh_status") != mesh_status:
+                continue
+            if submitted is not None and status.get("submitted") != submitted:
+                continue
 
-            if status["mesh_ok"] and not status["submitted"]:
-                ready.append(case_dir)
+            cases.append(case_dir)
 
-        if limit:
-            return ready[:limit]
+        return cases
 
-        return ready
+    def list_ready_cases(self):
+        """List cases ready for HPC submission (meshed but not submitted)"""
+        return self.list_cases_by_status(mesh_status="DONE", submitted=False)
 
-    def mark_submitted(self, case_path, job_id):
-        self.update_status(case_path, {
-            "submitted": True,
-            "job_id": job_id
-        })
+    def list_failed_cases(self):
+        """List cases with failed meshing"""
+        failed = []
+        for case_dir in sorted(self.output_dir.iterdir()):
+            if not case_dir.is_dir():
+                continue
+            status = self.get_status(case_dir)
+            if status and status.get("mesh_status") in ["FAILED", "ERROR"]:
+                failed.append(case_dir)
+        return failed
 
     # --------------------------------------------------
     # BULK GENERATION
@@ -263,25 +463,3 @@ class OpenFOAMCaseGenerator:
             print(f"Processing terrain_{case_info['terrain_index']} @ {case_info['rotation_degree']}°")
             output = self.setup_case(case_info)
             print(f"  → {output}")
-
-
-# --------------------------------------------------
-# USAGE
-# --------------------------------------------------
-
-if __name__ == "__main__":
-
-    generator = OpenFOAMCaseGenerator(
-        template_path="/home/sourav/CFD_Dataset/openfoam_caseGenerator/template",
-        input_dir="/home/sourav/CFD_Dataset/generateInputs/Data_test/downloads",
-        output_dir="/home/sourav/CFD_Dataset/openFoamCases"
-    )
-
-    generator.generate_all_cases()
-
-    # Example manual flow:
-    # ready = generator.list_ready_cases(limit=2)
-    # for case in ready:
-    #     generator.mesh_case(case)
-    #     # After manual sbatch:
-    #     generator.mark_submitted(case, job_id=123456)
